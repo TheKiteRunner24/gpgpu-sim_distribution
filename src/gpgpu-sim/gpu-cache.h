@@ -1670,11 +1670,27 @@ class l1_cache : public data_cache {
  public:
   l1_cache(const char *name, cache_config &config, int core_id, int type_id,
            mem_fetch_interface *memport, mem_fetch_allocator *mfcreator,
-           enum mem_fetch_status status, class gpgpu_sim *gpu)
+           enum mem_fetch_status status, class gpgpu_sim *gpu, unsigned max_warps_per_shader)
       : data_cache(name, config, core_id, type_id, memport, mfcreator, status,
-                   L1_WR_ALLOC_R, L1_WRBK_ACC, gpu) {}
+                   L1_WR_ALLOC_R, L1_WRBK_ACC, gpu) {
+    unsigned cache_lines_num = config.get_max_num_lines();
+    m_warp_id_array = new int[cache_lines_num];
+    for (unsigned i = 0; i < cache_lines_num; ++i) {
+      m_warp_id_array[i] = -1;
+    }
+    m_intra_warp_locality_score = new int[max_warps_per_shader];
+    for (unsigned i = 0; i < max_warps_per_shader; ++i) {
+      m_intra_warp_locality_score[i] = 0;
+    }
+  }
 
-  virtual ~l1_cache() {}
+  virtual ~l1_cache() {
+    delete[] m_warp_id_array;
+    delete[] m_intra_warp_locality_score;
+  }
+                   
+  int *m_warp_id_array;
+  int *m_intra_warp_locality_score;
 
   virtual enum cache_request_status access(new_addr_type addr, mem_fetch *mf,
                                            unsigned time,

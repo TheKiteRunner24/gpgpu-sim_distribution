@@ -363,6 +363,7 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_RRR,
   CONCRETE_SCHEDULER_WARP_LIMITING,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
+  CONCRETE_SCHEDULER_CUSTOM,
   NUM_CONCRETE_SCHEDULERS
 };
 
@@ -627,6 +628,30 @@ class swl_scheduler : public scheduler_unit {
  protected:
   scheduler_prioritization_type m_prioritization;
   unsigned m_num_warps_to_limit;
+};
+
+class custom_scheduler : public scheduler_unit {
+ public:
+  custom_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                Scoreboard *scoreboard, simt_stack **simt,
+                std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                register_set *dp_out, register_set *sfu_out,
+                register_set *int_out, register_set *tensor_core_out,
+                std::vector<register_set *> &spec_cores_out,
+                register_set *mem_out, int id)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id) {
+    m_shader = shader;
+  }
+  virtual ~custom_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.begin();
+  }
+
+  shader_core_ctx *m_shader;
+  int m_threshold = 1;
 };
 
 class opndcoll_rfu_t {  // operand collector based register file unit
@@ -1471,6 +1496,8 @@ class ldst_unit : public pipelined_simd_unit {
 
   std::vector<std::deque<mem_fetch *>> l1_latency_queue;
   void L1_latency_queue_cycle();
+
+  friend class custom_scheduler;
 };
 
 enum pipeline_stage_name_t {
@@ -2417,6 +2444,7 @@ class shader_core_ctx : public core_t {
   friend class scheduler_unit;  // this is needed to use private issue warp.
   friend class TwoLevelScheduler;
   friend class LooseRoundRobbinScheduler;
+  friend class custom_scheduler;
   virtual void issue_warp(register_set &warp, const warp_inst_t *pI,
                           const active_mask_t &active_mask, unsigned warp_id,
                           unsigned sch_id);

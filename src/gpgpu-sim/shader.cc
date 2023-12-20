@@ -197,10 +197,11 @@ void shader_core_ctx::create_schedulers() {
                             ? CONCRETE_SCHEDULER_RRR
                       : sched_config.find("old") != std::string::npos
                             ? CONCRETE_SCHEDULER_OLDEST_FIRST
-                            : sched_config.find("warp_limiting") !=
-                                      std::string::npos
+                            : sched_config.find("warp_limiting") != std::string::npos
                                   ? CONCRETE_SCHEDULER_WARP_LIMITING
-                                  : NUM_CONCRETE_SCHEDULERS;
+                                  : sched_config.find("custom") != std::string::npos
+                                        ? CONCRETE_SCHEDULER_CUSTOM
+                                        : NUM_CONCRETE_SCHEDULERS;
   assert(scheduler != NUM_CONCRETE_SCHEDULERS);
 
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
@@ -252,6 +253,14 @@ void shader_core_ctx::create_schedulers() {
             &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
             &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
             &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_CUSTOM:
+        schedulers.push_back(new custom_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i));
         break;
       default:
         abort();
@@ -1693,6 +1702,25 @@ void swl_scheduler::order_warps() {
   }
 }
 
+// order warps, then put them into m_next_cycle_prioritized_warps
+// at each cycle, scheduler_unit::cycle() will select a valid warp from m_next_cycle_prioritized_warps sequentially
+void custom_scheduler::order_warps() {
+
+  int last_issued_warp_id = (*m_last_supervised_issued)->get_warp_id();
+  int *intra_warp_locality_score = m_shader->m_ldst_unit->m_L1D->m_intra_warp_locality_score;
+
+  if(intra_warp_locality_score[last_issued_warp_id] >= m_threshold) { // keep this warp running by gto
+    order_by_priority(m_next_cycle_prioritized_warps, m_supervised_warps,
+                    m_last_supervised_issued, m_supervised_warps.size(),
+                    ORDERING_GREEDY_THEN_PRIORITY_FUNC,
+                    scheduler_unit::sort_warps_by_oldest_dynamic_id);
+  }
+  else { // change another warp by rr
+    order_lrr(m_next_cycle_prioritized_warps, m_supervised_warps,
+          m_last_supervised_issued, m_supervised_warps.size());
+  }
+}
+
 void shader_core_ctx::read_operands() {
   for (unsigned int i = 0; i < m_config->reg_file_port_throughput; ++i)
     m_operand_collector.step();
@@ -2602,7 +2630,7 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
     snprintf(L1D_name, STRSIZE, "L1D_%03d", m_sid);
     m_L1D = new l1_cache(L1D_name, m_config->m_L1D_config, m_sid,
                          get_shader_normal_cache_id(), m_icnt, m_mf_allocator,
-                         IN_L1D_MISS_QUEUE, core->get_gpu());
+                         IN_L1D_MISS_QUEUE, core->get_gpu(), m_config->max_warps_per_shader);
 
     l1_latency_queue.resize(m_config->m_L1D_config.l1_banks);
     assert(m_config->m_L1D_config.l1_latency > 0);
