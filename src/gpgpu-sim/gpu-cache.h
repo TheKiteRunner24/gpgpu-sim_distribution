@@ -1684,6 +1684,9 @@ class l1_cache : public data_cache {
     }
   }
 
+  // const unsigned SECTOR_CHUNCK_SIZE = 4;  // four sectors
+  // QV100 L1D is sector cache
+
   virtual ~l1_cache() {
     delete[] m_warp_id_array;
     delete[] m_intra_warp_locality_score;

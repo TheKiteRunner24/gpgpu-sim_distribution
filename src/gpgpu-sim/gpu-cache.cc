@@ -1801,6 +1801,9 @@ enum cache_request_status l1_cache::access(new_addr_type addr, mem_fetch *mf,
       m_warp_id_array[cache_index] = warp_id;
     }
   }
+  else if(access_status == MISS) { // when alloc a new cache line
+    m_warp_id_array[cache_index] = warp_id;
+  }
   return access_status;
 }
 
