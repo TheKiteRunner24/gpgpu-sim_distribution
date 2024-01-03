@@ -1790,19 +1790,29 @@ enum cache_request_status l1_cache::access(new_addr_type addr, mem_fetch *mf,
   m_stats.inc_stats(mf->get_access_type(),
                     m_stats.select_stats_status(probe_status, access_status));
   m_stats.inc_stats_pw(mf->get_access_type(), m_stats.select_stats_status(
-                                                  probe_status, access_status));             
+                                                  probe_status, access_status));     
   unsigned warp_id = mf->get_wid();
+  mem_access_sector_mask_t mask = mf->get_access_sector_mask();
+  unsigned sector_idx = (unsigned)-1;
+  for (unsigned i = 0; i < SECTOR_CHUNCK_SIZE; ++i) {
+    if (mask.to_ulong() & (1 << i)) {
+      sector_idx = i;
+      break;
+    }
+  }
+  assert(cache_index != -1);
+  assert(sector_idx != -1 && sector_idx != SECTOR_CHUNCK_SIZE);
   if(access_status == (HIT || HIT_RESERVED)) {
-    if(warp_id == m_warp_id_array[cache_index]) { // hit by same warp
+    if(warp_id == m_warp_id_array[cache_index][sector_idx]) { // hit by same warp
       m_intra_warp_locality_score[warp_id]++;
     }
     else { // hit by another warp
       m_intra_warp_locality_score[warp_id] = std::max(m_intra_warp_locality_score[warp_id]-1, 0);
-      m_warp_id_array[cache_index] = warp_id;
+      m_warp_id_array[cache_index][sector_idx] = warp_id;
     }
   }
-  else if(access_status == MISS) { // when alloc a new cache line
-    m_warp_id_array[cache_index] = warp_id;
+  else if(access_status == SECTOR_MISS) {
+    m_warp_id_array[cache_index][sector_idx] = warp_id;
   }
   return access_status;
 }
