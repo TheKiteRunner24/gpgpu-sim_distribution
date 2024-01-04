@@ -1673,33 +1673,53 @@ class l1_cache : public data_cache {
            enum mem_fetch_status status, class gpgpu_sim *gpu, unsigned max_warps_per_shader)
       : data_cache(name, config, core_id, type_id, memport, mfcreator, status,
                    L1_WR_ALLOC_R, L1_WRBK_ACC, gpu) {
+    m_max_warps_per_shader = max_warps_per_shader;
     m_cache_lines_num = config.get_max_num_lines();
-    m_warp_id_array = new int *[m_cache_lines_num];
+    // each line has a warp id
+    m_warp_id_array = new int[m_cache_lines_num];
     for (unsigned i = 0; i < m_cache_lines_num; ++i) {
-      m_warp_id_array[i] = new int[SECTOR_CHUNCK_SIZE];
+      m_warp_id_array[i] = -1;
+    }
+    // each sector has a warp id
+    m_warp_id_array_sector = new int *[m_cache_lines_num];
+    for (unsigned i = 0; i < m_cache_lines_num; ++i) {
+      m_warp_id_array_sector[i] = new int[SECTOR_CHUNCK_SIZE];
     }
     for (unsigned i = 0; i < m_cache_lines_num; ++i) {
       for (unsigned j = 0; j < SECTOR_CHUNCK_SIZE; ++j) {
-        m_warp_id_array[i][j] = -1;
+        m_warp_id_array_sector[i][j] = -1;
       }
     }
+    // each warp has a score
     m_intra_warp_locality_score = new int[max_warps_per_shader];
     for (unsigned i = 0; i < max_warps_per_shader; ++i) {
       m_intra_warp_locality_score[i] = 0;
     }
+    m_intra_warp_locality_score_sector = new int[max_warps_per_shader];
+    for (unsigned i = 0; i < max_warps_per_shader; ++i) {
+      m_intra_warp_locality_score_sector[i] = 0;
+    }
   }
 
   virtual ~l1_cache() {
-    for (int i = 0; i < m_cache_lines_num; ++i) {
-      delete[] m_warp_id_array[i];
-    }
     delete[] m_warp_id_array;
+    for (int i = 0; i < m_cache_lines_num; ++i) {
+      delete[] m_warp_id_array_sector[i];
+    }
+    delete[] m_warp_id_array_sector;
     delete[] m_intra_warp_locality_score;
+    delete[] m_intra_warp_locality_score_sector;
   }
 
+  //debug
+  unsigned m_max_warps_per_shader;
+
+  
   unsigned m_cache_lines_num;
-  int **m_warp_id_array;
+  int *m_warp_id_array;
+  int **m_warp_id_array_sector;
   int *m_intra_warp_locality_score;
+  int *m_intra_warp_locality_score_sector;
 
   virtual enum cache_request_status access(new_addr_type addr, mem_fetch *mf,
                                            unsigned time,
