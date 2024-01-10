@@ -101,8 +101,8 @@ class thread_ctx_t {
 
 class shd_warp_t {
  public:
-  shd_warp_t(class shader_core_ctx *shader, unsigned warp_size)
-      : m_shader(shader), m_warp_size(warp_size) {
+  shd_warp_t(class shader_core_ctx *shader, unsigned warp_size, unsigned max_warps_per_core)
+      : m_shader(shader), m_warp_size(warp_size), m_max_warps_per_core(max_warps_per_core) {
     m_stores_outstanding = 0;
     m_inst_in_pipeline = 0;
     reset();
@@ -137,6 +137,9 @@ class shd_warp_t {
       m_ldgdepbar_buf[i].clear();
     }
     m_ldgdepbar_buf.clear();
+
+    m_L1D_hit_count.resize(m_max_warps_per_core);
+    std::fill_n(m_L1D_hit_count.begin(), m_max_warps_per_core, 0);
   }
   void init(address_type start_pc, unsigned cta_id, unsigned wid,
             const std::bitset<MAX_WARP_SIZE> &active,
@@ -168,6 +171,8 @@ class shd_warp_t {
       m_ldgdepbar_buf[i].clear();
     }
     m_ldgdepbar_buf.clear();
+
+    std::fill_n(m_L1D_hit_count.begin(), m_max_warps_per_core, 0);
   }
 
   bool functional_done() const;
@@ -280,6 +285,7 @@ class shd_warp_t {
   unsigned m_warp_id;
   unsigned m_warp_size;
   unsigned m_dynamic_warp_id;
+  unsigned m_max_warps_per_core;
 
   address_type m_next_pc;
   unsigned n_completed;  // number of threads in warp completed
@@ -324,6 +330,9 @@ class shd_warp_t {
     unsigned int m_depbar_start_id;
     unsigned int m_depbar_group;
     bool m_waiting_ldgsts; // Ni: Whether the warp is waiting for the LDGSTS instrs to finish
+
+  public:
+    std::vector<int> m_L1D_hit_count;
 };
 
 inline unsigned hw_tid_from_wid(unsigned wid, unsigned warp_size, unsigned i) {
@@ -641,17 +650,12 @@ class custom_scheduler : public scheduler_unit {
                 register_set *mem_out, int id)
       : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
                        sfu_out, int_out, tensor_core_out, spec_cores_out,
-                       mem_out, id) {
-    m_shader = shader;
-  }
+                       mem_out, id) {}
   virtual ~custom_scheduler() {}
   virtual void order_warps();
   virtual void done_adding_supervised_warps() {
     m_last_supervised_issued = m_supervised_warps.begin();
   }
-
-  shader_core_ctx *m_shader;
-  int m_threshold = 1;
 };
 
 class opndcoll_rfu_t {  // operand collector based register file unit
@@ -1473,6 +1477,7 @@ class ldst_unit : public pipelined_simd_unit {
   tex_cache *m_L1T;        // texture cache
   read_only_cache *m_L1C;  // constant cache
   l1_cache *m_L1D;         // data cache
+  std::vector<int> m_L1D_line_wid;
   std::map<unsigned /*warp_id*/,
            std::map<unsigned /*regnum*/, unsigned /*count*/>>
       m_pending_writes;
@@ -1496,8 +1501,6 @@ class ldst_unit : public pipelined_simd_unit {
 
   std::vector<std::deque<mem_fetch *>> l1_latency_queue;
   void L1_latency_queue_cycle();
-
-  friend class custom_scheduler;
 };
 
 enum pipeline_stage_name_t {
@@ -2444,7 +2447,7 @@ class shader_core_ctx : public core_t {
   friend class scheduler_unit;  // this is needed to use private issue warp.
   friend class TwoLevelScheduler;
   friend class LooseRoundRobbinScheduler;
-  friend class custom_scheduler;
+  friend class ldst_unit;
   virtual void issue_warp(register_set &warp, const warp_inst_t *pI,
                           const active_mask_t &active_mask, unsigned warp_id,
                           unsigned sch_id);

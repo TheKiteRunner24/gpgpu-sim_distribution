@@ -1777,8 +1777,8 @@ enum cache_request_status data_cache::access(new_addr_type addr, mem_fetch *mf,
 /// (the policy used in fermi according to the CUDA manual)
 enum cache_request_status l1_cache::access(new_addr_type addr, mem_fetch *mf,
                                            unsigned time,
-                                           std::list<cache_event> &events) {
-  //return data_cache::access(addr, mf, time, events);
+                                           std::list<cache_event> &events, unsigned &line_index) {
+  // return data_cache::access(addr, mf, time, events);
   assert(mf->get_data_size() <= m_config.get_atom_sz());
   bool wr = mf->get_is_write();
   new_addr_type block_addr = m_config.block_addr(addr);
@@ -1791,63 +1791,7 @@ enum cache_request_status l1_cache::access(new_addr_type addr, mem_fetch *mf,
                     m_stats.select_stats_status(probe_status, access_status));
   m_stats.inc_stats_pw(mf->get_access_type(), m_stats.select_stats_status(
                                                   probe_status, access_status));
-
-  unsigned warp_id = mf->get_wid();
-  // get sector index
-  mem_access_sector_mask_t mask = mf->get_access_sector_mask();
-  unsigned sector_idx = (unsigned)-1;
-  for (unsigned i = 0; i < SECTOR_CHUNCK_SIZE; ++i) {
-    if (mask.to_ulong() & (1 << i)) {
-      sector_idx = i;
-      break;
-    }
-  }
-  assert(sector_idx != -1 && sector_idx != SECTOR_CHUNCK_SIZE);
-  if(access_status == HIT || access_status == HIT_RESERVED) {
-    // line
-    if(warp_id == m_warp_id_array[cache_index]) { // hit by same warp
-      m_intra_warp_locality_score[warp_id]++;
-    }
-    else { // hit by another warp
-      // m_intra_warp_locality_score[warp_id] = std::max(m_intra_warp_locality_score[warp_id]-1, 0);
-      m_intra_warp_locality_score[warp_id]--;
-      m_warp_id_array[cache_index] = warp_id;
-    }
-    // sector
-    if(warp_id == m_warp_id_array_sector[cache_index][sector_idx]) { // hit by same warp
-      m_intra_warp_locality_score_sector[warp_id]++;
-    }
-    else { // hit by another warp
-      m_intra_warp_locality_score_sector[warp_id]--;
-      m_warp_id_array_sector[cache_index][sector_idx] = warp_id;
-    }
-
-    // debug
-    // printf("\n shader %u score :", mf->get_sid());
-    // for (unsigned i = 0; i < m_max_warps_per_shader; ++i) {
-    //   printf("%d ",m_intra_warp_locality_score[i]);
-    // }
-    // printf("\n");
-    // printf("\n shader %u score_sector :", mf->get_sid());
-    // for (unsigned i = 0; i < m_max_warps_per_shader; ++i) {
-    //   printf("%d ",m_intra_warp_locality_score_sector[i]);
-    // }
-    // printf("\n");
-
-  }
-  else if(access_status == MISS) {
-    // line
-    m_warp_id_array[cache_index] = warp_id;
-    // sector
-    for (unsigned i = 0; i < SECTOR_CHUNCK_SIZE; ++i) {
-      // if(i == sector_idx) {m_warp_id_array[cache_index][sector_idx] = warp_id;}
-      // else {m_warp_id_array[cache_index][sector_idx] = -1;}
-      m_warp_id_array_sector[cache_index][i] = warp_id;
-    }
-  }
-  else if(access_status == SECTOR_MISS) {
-    m_warp_id_array_sector[cache_index][sector_idx] = warp_id;
-  }
+  line_index = cache_index;
   return access_status;
 }
 

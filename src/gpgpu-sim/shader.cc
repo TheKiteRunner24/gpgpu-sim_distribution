@@ -93,7 +93,7 @@ std::list<unsigned> shader_core_ctx::get_regs_written(const inst_t &fvt) const {
 void exec_shader_core_ctx::create_shd_warp() {
   m_warp.resize(m_config->max_warps_per_shader);
   for (unsigned k = 0; k < m_config->max_warps_per_shader; ++k) {
-    m_warp[k] = new shd_warp_t(this, m_config->warp_size);
+    m_warp[k] = new shd_warp_t(this, m_config->warp_size, m_config->max_warps_per_shader);
   }
 }
 
@@ -1702,35 +1702,27 @@ void swl_scheduler::order_warps() {
   }
 }
 
+bool compare_warps_by_hit_count(shd_warp_t* warp1, shd_warp_t* warp2, std::vector<int> hit_count) {
+  return hit_count[warp1->get_warp_id()] > hit_count[warp1->get_warp_id()];
+}
+
 // order warps, then put them into m_next_cycle_prioritized_warps
 // at each cycle, scheduler_unit::cycle() will select a valid warp from m_next_cycle_prioritized_warps sequentially
 void custom_scheduler::order_warps() {
-
-  int last_issued_warp_id = (*m_last_supervised_issued)->get_warp_id();
-  int *intra_warp_locality_score = m_shader->m_ldst_unit->m_L1D->m_intra_warp_locality_score;
-  int *intra_warp_locality_score_sector = m_shader->m_ldst_unit->m_L1D->m_intra_warp_locality_score_sector;
-
-  if(intra_warp_locality_score[last_issued_warp_id] <= -100) {
-    order_lrr(m_next_cycle_prioritized_warps, m_supervised_warps,
-                    m_last_supervised_issued, m_supervised_warps.size());
+  // greedy
+  m_next_cycle_prioritized_warps.push_back(*m_last_supervised_issued);
+  // sort by hit count
+  std::vector<int> hit_count = (*m_last_supervised_issued)->m_L1D_hit_count;
+  std::vector<shd_warp_t *> temp = m_supervised_warps;
+  std::sort(temp.begin(), temp.end(), [&](shd_warp_t* warp1, shd_warp_t* warp2) {
+    return compare_warps_by_hit_count(warp1, warp2, hit_count);
+  });
+  std::vector<shd_warp_t *>::iterator iter = temp.begin();
+  for (unsigned count = 0; count < m_supervised_warps.size(); ++count, ++iter) {
+    if (*iter != *m_last_supervised_issued) {
+      m_next_cycle_prioritized_warps.push_back(*iter);
+    }
   }
-  else {
-    order_by_priority(m_next_cycle_prioritized_warps, m_supervised_warps,
-                    m_last_supervised_issued, m_supervised_warps.size(),
-                    ORDERING_GREEDY_THEN_PRIORITY_FUNC,
-                    scheduler_unit::sort_warps_by_oldest_dynamic_id);
-  }
-
-  // if(intra_warp_locality_score_sector[last_issued_warp_id] >= m_threshold) { // keep this warp running by gto
-  //   order_by_priority(m_next_cycle_prioritized_warps, m_supervised_warps,
-  //                   m_last_supervised_issued, m_supervised_warps.size(),
-  //                   ORDERING_GREEDY_THEN_PRIORITY_FUNC,
-  //                   scheduler_unit::sort_warps_by_oldest_dynamic_id);
-  // }
-  // else { // change another warp by rr
-  //   order_lrr(m_next_cycle_prioritized_warps, m_supervised_warps,
-  //         m_last_supervised_issued, m_supervised_warps.size());
-  // }
 }
 
 void shader_core_ctx::read_operands() {
@@ -2128,10 +2120,11 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
                               m_core->get_gpu()->gpu_sim_cycle +
                                   m_core->get_gpu()->gpu_tot_sim_cycle);
     std::list<cache_event> events;
+    unsigned line_index = 0;
     enum cache_request_status status = cache->access(
         mf->get_addr(), mf,
         m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle,
-        events);
+        events, line_index);
     return process_cache_access(cache, mf->get_addr(), inst, events, mf,
                                 status);
   }
@@ -2142,11 +2135,18 @@ void ldst_unit::L1_latency_queue_cycle() {
     if ((l1_latency_queue[j][0]) != NULL) {
       mem_fetch *mf_next = l1_latency_queue[j][0];
       std::list<cache_event> events;
+      unsigned line_index = 0;
       enum cache_request_status status =
           m_L1D->access(mf_next->get_addr(), mf_next,
                         m_core->get_gpu()->gpu_sim_cycle +
                             m_core->get_gpu()->gpu_tot_sim_cycle,
-                        events);
+                        events, line_index);
+
+      unsigned warp_id = mf_next->get_wid();
+      if(status == HIT || status == HIT_RESERVED) {
+        m_core->m_warp[m_L1D_line_wid[line_index]]->m_L1D_hit_count[warp_id]++;
+      }
+      m_L1D_line_wid[line_index] = warp_id;
 
       bool write_sent = was_write_sent(events);
       bool read_sent = was_read_sent(events);
@@ -2637,12 +2637,14 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
   assert(config->smem_latency > 1);
   init(icnt, mf_allocator, core, operand_collector, scoreboard, config,
        mem_config, stats, sid, tpc);
+  m_L1D_line_wid.resize(m_config->m_L1D_config.get_max_num_lines());
+  std::fill_n(m_L1D_line_wid.begin(), m_config->m_L1D_config.get_max_num_lines(), -1);
   if (!m_config->m_L1D_config.disabled()) {
     char L1D_name[STRSIZE];
     snprintf(L1D_name, STRSIZE, "L1D_%03d", m_sid);
     m_L1D = new l1_cache(L1D_name, m_config->m_L1D_config, m_sid,
                          get_shader_normal_cache_id(), m_icnt, m_mf_allocator,
-                         IN_L1D_MISS_QUEUE, core->get_gpu(), m_config->max_warps_per_shader);
+                         IN_L1D_MISS_QUEUE, core->get_gpu());
 
     l1_latency_queue.resize(m_config->m_L1D_config.l1_banks);
     assert(m_config->m_L1D_config.l1_latency > 0);
