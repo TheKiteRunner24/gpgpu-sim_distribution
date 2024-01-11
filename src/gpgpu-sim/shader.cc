@@ -1703,7 +1703,7 @@ void swl_scheduler::order_warps() {
 }
 
 bool compare_warps_by_hit_count(shd_warp_t* warp1, shd_warp_t* warp2, std::vector<int> hit_count) {
-  return hit_count[warp1->get_warp_id()] > hit_count[warp1->get_warp_id()];
+  return hit_count[warp1->get_warp_id()] > hit_count[warp2->get_warp_id()];
 }
 
 // order warps, then put them into m_next_cycle_prioritized_warps
