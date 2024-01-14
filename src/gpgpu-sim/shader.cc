@@ -1702,25 +1702,34 @@ void swl_scheduler::order_warps() {
   }
 }
 
-bool compare_warps_by_hit_count(shd_warp_t* warp1, shd_warp_t* warp2, std::vector<int> hit_count) {
-  return hit_count[warp1->get_warp_id()] > hit_count[warp2->get_warp_id()];
+bool compare_warps(shd_warp_t* warp1, shd_warp_t* warp2, std::vector<int>& hit_count) {
+  if (warp1 && warp2) {
+    if (warp1->done_exit() || warp1->waiting()) {
+      return false;
+    } else if (warp2->done_exit() || warp2->waiting()) {
+      return true;
+    } else {
+      return hit_count[warp1->get_warp_id()] > hit_count[warp2->get_warp_id()];
+    }
+  } else {
+    return warp1 < warp2;
+  }
 }
 
 // order warps, then put them into m_next_cycle_prioritized_warps
 // at each cycle, scheduler_unit::cycle() will select a valid warp from m_next_cycle_prioritized_warps sequentially
 void custom_scheduler::order_warps() {
+  m_next_cycle_prioritized_warps.clear();
   // greedy
   m_next_cycle_prioritized_warps.push_back(*m_last_supervised_issued);
   // sort by hit count
-  std::vector<int> hit_count = (*m_last_supervised_issued)->m_L1D_hit_count;
   std::vector<shd_warp_t *> temp = m_supervised_warps;
   std::sort(temp.begin(), temp.end(), [&](shd_warp_t* warp1, shd_warp_t* warp2) {
-    return compare_warps_by_hit_count(warp1, warp2, hit_count);
+    return compare_warps(warp1, warp2, (*m_last_supervised_issued)->m_L1D_hit_count);
   });
-  std::vector<shd_warp_t *>::iterator iter = temp.begin();
-  for (unsigned count = 0; count < m_supervised_warps.size(); ++count, ++iter) {
-    if (*iter != *m_last_supervised_issued) {
-      m_next_cycle_prioritized_warps.push_back(*iter);
+  for (shd_warp_t* warp : temp) {
+    if (warp != *m_last_supervised_issued) {
+      m_next_cycle_prioritized_warps.push_back(std::move(warp));
     }
   }
 }
@@ -2120,11 +2129,12 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
                               m_core->get_gpu()->gpu_sim_cycle +
                                   m_core->get_gpu()->gpu_tot_sim_cycle);
     std::list<cache_event> events;
-    unsigned line_index = 0;
+    unsigned line_index = (unsigned)-1;
     enum cache_request_status status = cache->access(
         mf->get_addr(), mf,
         m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle,
         events, line_index);
+    assert(line_index != -1);
     return process_cache_access(cache, mf->get_addr(), inst, events, mf,
                                 status);
   }
@@ -2135,13 +2145,13 @@ void ldst_unit::L1_latency_queue_cycle() {
     if ((l1_latency_queue[j][0]) != NULL) {
       mem_fetch *mf_next = l1_latency_queue[j][0];
       std::list<cache_event> events;
-      unsigned line_index = 0;
+      unsigned line_index = (unsigned)-1;
       enum cache_request_status status =
           m_L1D->access(mf_next->get_addr(), mf_next,
                         m_core->get_gpu()->gpu_sim_cycle +
                             m_core->get_gpu()->gpu_tot_sim_cycle,
                         events, line_index);
-
+      assert(line_index != -1);
       unsigned warp_id = mf_next->get_wid();
       if(status == HIT || status == HIT_RESERVED) {
         m_core->m_warp[m_L1D_line_wid[line_index]]->m_L1D_hit_count[warp_id]++;
