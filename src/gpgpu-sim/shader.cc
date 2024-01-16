@@ -2129,12 +2129,11 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
                               m_core->get_gpu()->gpu_sim_cycle +
                                   m_core->get_gpu()->gpu_tot_sim_cycle);
     std::list<cache_event> events;
-    unsigned line_index = (unsigned)-1;
+    unsigned line_index = 0;
     enum cache_request_status status = cache->access(
         mf->get_addr(), mf,
         m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle,
         events, line_index);
-    assert(line_index != -1);
     return process_cache_access(cache, mf->get_addr(), inst, events, mf,
                                 status);
   }
@@ -2151,12 +2150,14 @@ void ldst_unit::L1_latency_queue_cycle() {
                         m_core->get_gpu()->gpu_sim_cycle +
                             m_core->get_gpu()->gpu_tot_sim_cycle,
                         events, line_index);
-      assert(line_index != -1);
       unsigned warp_id = mf_next->get_wid();
-      if(status == HIT || status == HIT_RESERVED) {
-        m_core->m_warp[m_L1D_line_wid[line_index]]->m_L1D_hit_count[warp_id]++;
+      // when RESERVATION_FAIL, line_index = -1
+      if (line_index != -1) {
+        if (status == HIT || status == HIT_RESERVED) {
+          m_core->m_warp[m_L1D_line_wid[line_index]]->m_L1D_hit_count[warp_id]++;
+        }
+        m_L1D_line_wid[line_index] = warp_id;
       }
-      m_L1D_line_wid[line_index] = warp_id;
 
       bool write_sent = was_write_sent(events);
       bool read_sent = was_read_sent(events);
