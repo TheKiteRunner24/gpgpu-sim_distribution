@@ -274,6 +274,9 @@ class shd_warp_t {
   unsigned get_dynamic_warp_id() const { return m_dynamic_warp_id; }
   unsigned get_warp_id() const { return m_warp_id; }
 
+  unsigned get_warp_gto_priority() const { return m_warp_gto_priority; }
+  void set_warp_gto_priority(unsigned priority) { m_warp_gto_priority = priority; }
+
   class shader_core_ctx *get_shader() {
     return m_shader;
   }
@@ -285,6 +288,7 @@ class shd_warp_t {
   unsigned m_warp_id;
   unsigned m_warp_size;
   unsigned m_dynamic_warp_id;
+  unsigned m_warp_gto_priority;
   unsigned m_max_warps_per_core;
 
   address_type m_next_pc;

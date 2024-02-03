@@ -33,6 +33,7 @@
 #include <float.h>
 #include <limits.h>
 #include <string.h>
+#include <numeric>
 #include "../../libcuda/gpgpu_context.h"
 #include "../cuda-sim/cuda-sim.h"
 #include "../cuda-sim/ptx-stats.h"
@@ -1702,31 +1703,54 @@ void swl_scheduler::order_warps() {
   }
 }
 
-bool compare_warps(shd_warp_t* warp1, shd_warp_t* warp2, std::vector<int>& hit_count) {
+bool compare_warps(shd_warp_t* warp1, shd_warp_t* warp2, std::vector<unsigned> count_priority) {
   if (warp1 && warp2) {
     if (warp1->done_exit() || warp1->waiting()) {
       return false;
     } else if (warp2->done_exit() || warp2->waiting()) {
       return true;
     } else {
-      return hit_count[warp1->get_warp_id()] > hit_count[warp2->get_warp_id()];
+      unsigned warp1_priority = warp1->get_warp_gto_priority() + count_priority[warp1->get_warp_id()];
+      unsigned warp2_priority = warp2->get_warp_gto_priority() + count_priority[warp2->get_warp_id()];
+      return warp1_priority > warp2_priority;
     }
   } else {
-    return warp1 < warp2;
+    return true;
   }
 }
+
+#define HIT_COUNT_WEIGHT 10
 
 // order warps, then put them into m_next_cycle_prioritized_warps
 // at each cycle, scheduler_unit::cycle() will select a valid warp from m_next_cycle_prioritized_warps sequentially
 void custom_scheduler::order_warps() {
   m_next_cycle_prioritized_warps.clear();
-  // greedy
-  m_next_cycle_prioritized_warps.push_back(*m_last_supervised_issued);
-  // sort by hit count
+
+  m_next_cycle_prioritized_warps.push_back(*m_last_supervised_issued); // greedy
+
+  unsigned total_hit_count = std::accumulate((*m_last_supervised_issued)->m_L1D_hit_count.begin(),
+                                             (*m_last_supervised_issued)->m_L1D_hit_count.end(), 0);
+  
+  std::vector<unsigned> count_priority;
+  for (const auto& hc : (*m_last_supervised_issued)->m_L1D_hit_count) {
+    unsigned cp = (unsigned)round(HIT_COUNT_WEIGHT * ((float)hc / total_hit_count));
+    count_priority.push_back(cp);
+  }
+  
+  // first sort, according to dynamic_id
   std::vector<shd_warp_t *> temp = m_supervised_warps;
+  std::sort(temp.begin(), temp.end(), scheduler_unit::sort_warps_by_oldest_dynamic_id);
+  unsigned gto_priority = 0;
+  for (auto rit = temp.rbegin(); rit != temp.rend(); ++rit) { // reverse_iterator
+    (*rit)->set_warp_gto_priority(gto_priority);
+    gto_priority++;
+  }
+
+  // second sort, according to gto_priority and hit_count
   std::sort(temp.begin(), temp.end(), [&](shd_warp_t* warp1, shd_warp_t* warp2) {
-    return compare_warps(warp1, warp2, (*m_last_supervised_issued)->m_L1D_hit_count);
+    return compare_warps(warp1, warp2, count_priority);
   });
+
   for (shd_warp_t* warp : temp) {
     if (warp != *m_last_supervised_issued) {
       m_next_cycle_prioritized_warps.push_back(std::move(warp));
