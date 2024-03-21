@@ -988,10 +988,11 @@ class tag_array {
             cache_block_t **new_lines);
   void init(int core_id, int type_id);
 
+ public:
+  cache_block_t **m_lines; /* nbanks x nset x assoc lines in total */
+
  protected:
   cache_config &m_config;
-
-  cache_block_t **m_lines; /* nbanks x nset x assoc lines in total */
 
   unsigned m_access;
   unsigned m_miss;
@@ -1361,10 +1362,12 @@ class baseline_cache : public cache_t {
     init(name, config, memport, status);
   }
 
+ public:
+  tag_array *m_tag_array;
+
  protected:
   std::string m_name;
   cache_config &m_config;
-  tag_array *m_tag_array;
   mshr_table m_mshrs;
   std::list<mem_fetch *> m_miss_queue;
   enum mem_fetch_status m_miss_queue_status;

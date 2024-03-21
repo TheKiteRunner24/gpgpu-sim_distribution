@@ -140,6 +140,9 @@ class shd_warp_t {
 
     m_L1D_hit_count.resize(m_max_warps_per_core);
     std::fill_n(m_L1D_hit_count.begin(), m_max_warps_per_core, 0);
+
+    m_L1D_hit_count_new.resize(m_max_warps_per_core);
+    std::fill_n(m_L1D_hit_count_new.begin(), m_max_warps_per_core, 0);
   }
   void init(address_type start_pc, unsigned cta_id, unsigned wid,
             const std::bitset<MAX_WARP_SIZE> &active,
@@ -173,6 +176,8 @@ class shd_warp_t {
     m_ldgdepbar_buf.clear();
 
     std::fill_n(m_L1D_hit_count.begin(), m_max_warps_per_core, 0);
+
+    std::fill_n(m_L1D_hit_count_new.begin(), m_max_warps_per_core, 0);
   }
 
   bool functional_done() const;
@@ -337,6 +342,9 @@ class shd_warp_t {
 
   public:
     std::vector<int> m_L1D_hit_count;
+
+    // 这个count是基于bitset信息的count
+    std::vector<int> m_L1D_hit_count_new; 
 };
 
 inline unsigned hw_tid_from_wid(unsigned wid, unsigned warp_size, unsigned i) {
@@ -377,6 +385,7 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_WARP_LIMITING,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
   CONCRETE_SCHEDULER_CUSTOM,
+  CONCRETE_SCHEDULER_TEST,
   NUM_CONCRETE_SCHEDULERS
 };
 
@@ -656,6 +665,25 @@ class custom_scheduler : public scheduler_unit {
                        sfu_out, int_out, tensor_core_out, spec_cores_out,
                        mem_out, id) {}
   virtual ~custom_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.begin();
+  }
+};
+
+class test_scheduler : public scheduler_unit {
+ public:
+  test_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                Scoreboard *scoreboard, simt_stack **simt,
+                std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                register_set *dp_out, register_set *sfu_out,
+                register_set *int_out, register_set *tensor_core_out,
+                std::vector<register_set *> &spec_cores_out,
+                register_set *mem_out, int id)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id) {}
+  virtual ~test_scheduler() {}
   virtual void order_warps();
   virtual void done_adding_supervised_warps() {
     m_last_supervised_issued = m_supervised_warps.begin();
@@ -1451,6 +1479,24 @@ class ldst_unit : public pipelined_simd_unit {
             Scoreboard *scoreboard, const shader_core_config *config,
             const memory_config *mem_config, shader_core_stats *stats,
             unsigned sid, unsigned tpc);
+ public:
+  unsigned m_max_warps_per_shader;
+
+  l1_cache *m_L1D;         // data cache
+  
+  // 每个sector一个warp id
+  std::vector<std::vector<int>> m_L1D_warp_id_array;
+  // 每个line一个warp id
+  std::vector<int> m_L1D_warp_id_array_only_line;
+  // 每个sector统计全部的warp访问情况
+  std::vector<std::vector<std::bitset<64>>> m_L1D_warp_bitset_array;
+
+  // 统计sector被替换时，有多少warp访问过，结果累加
+  std::vector<unsigned long long> m_sector_access_count;
+  // 统计sector被替换时，有多少load warp的访问，多少其他warp的访问，结果累加
+  unsigned long long m_sector_access_by_load_warp = 0;
+  unsigned long long m_sector_access_by_other_warp = 0;
+  std::vector<std::vector<int>> m_load_warp_id_array;
 
  protected:
   bool shared_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
@@ -1480,8 +1526,6 @@ class ldst_unit : public pipelined_simd_unit {
 
   tex_cache *m_L1T;        // texture cache
   read_only_cache *m_L1C;  // constant cache
-  l1_cache *m_L1D;         // data cache
-  std::vector<int> m_L1D_line_wid;
   std::map<unsigned /*warp_id*/,
            std::map<unsigned /*regnum*/, unsigned /*count*/>>
       m_pending_writes;
@@ -2555,7 +2599,6 @@ class shader_core_ctx : public core_t {
   std::vector<unsigned> m_issue_port;
   std::vector<simd_function_unit *>
       m_fu;  // stallable pipelines should be last in this array
-  ldst_unit *m_ldst_unit;
   static const unsigned MAX_ALU_LATENCY = 512;
   unsigned num_result_bus;
   std::vector<std::bitset<MAX_ALU_LATENCY> *> m_result_bus;
@@ -2583,6 +2626,9 @@ class shader_core_ctx : public core_t {
   unsigned int m_occupied_ctas;
   std::bitset<MAX_THREAD_PER_SM> m_occupied_hwtid;
   std::map<unsigned int, unsigned int> m_occupied_cta_to_hwtid;
+
+ public:
+  ldst_unit *m_ldst_unit;
 };
 
 class exec_shader_core_ctx : public shader_core_ctx {
@@ -2660,6 +2706,8 @@ class simt_core_cluster {
   void get_L1D_sub_stats(struct cache_sub_stats &css) const;
   void get_L1C_sub_stats(struct cache_sub_stats &css) const;
   void get_L1T_sub_stats(struct cache_sub_stats &css) const;
+
+  void get_sector_access_count(std::vector<unsigned long long> &count, unsigned long long &by_load, unsigned long long &by_other);
 
   void get_icnt_stats(long &n_simt_to_mem, long &n_mem_to_simt) const;
   float get_current_occupancy(unsigned long long &active,

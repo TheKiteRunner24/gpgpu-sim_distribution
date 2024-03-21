@@ -202,7 +202,9 @@ void shader_core_ctx::create_schedulers() {
                                   ? CONCRETE_SCHEDULER_WARP_LIMITING
                                   : sched_config.find("custom") != std::string::npos
                                         ? CONCRETE_SCHEDULER_CUSTOM
-                                        : NUM_CONCRETE_SCHEDULERS;
+                                        : sched_config.find("test") != std::string::npos
+                                              ? CONCRETE_SCHEDULER_TEST
+                                              : NUM_CONCRETE_SCHEDULERS;
   assert(scheduler != NUM_CONCRETE_SCHEDULERS);
 
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
@@ -257,6 +259,14 @@ void shader_core_ctx::create_schedulers() {
         break;
       case CONCRETE_SCHEDULER_CUSTOM:
         schedulers.push_back(new custom_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i));
+        break;
+      case CONCRETE_SCHEDULER_TEST:
+        schedulers.push_back(new test_scheduler(
             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
             &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
             &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
@@ -970,7 +980,35 @@ void shader_core_ctx::fetch() {
               did_exit = true;
             }
           }
-          if (did_exit) m_warp[warp_id]->set_done_exit();
+          if (did_exit) {
+            m_warp[warp_id]->set_done_exit();
+
+            // warp执行结束时打印 hit count
+            // printf("\n");
+            // printf("core %d : warp %d exit  ", m_sid, warp_id);
+            // for (unsigned j = 0; j < m_config->max_warps_per_shader; j++) {
+            //   printf("%d ", m_warp[warp_id]->m_L1D_hit_count[j]);
+            // }
+            // printf("\n");
+
+            // warp执行完的时候，清掉自己在其他warp的计数
+            for (unsigned w = 0; w < m_config->max_warps_per_shader; w++) {
+              m_warp[w]->m_L1D_hit_count[warp_id] = 0;
+              m_warp[w]->m_L1D_hit_count_new[warp_id] = 0;
+            }
+            // 清掉自己在sector里的warp id
+            for (int l = 0; l < m_ldst_unit->m_L1D_warp_id_array.size(); l++) {
+              if (m_ldst_unit->m_L1D_warp_id_array_only_line[l] = warp_id) {
+                m_ldst_unit->m_L1D_warp_id_array_only_line[l] = -1;
+              }
+              for(int s = 0; s < 4; s++) {
+                if (m_ldst_unit->m_L1D_warp_id_array[l][s] == warp_id){
+                  m_ldst_unit->m_L1D_warp_id_array[l][s] = -1;
+                  m_ldst_unit->m_L1D_warp_bitset_array[l][s].reset(warp_id);
+                }
+              }
+            }
+          }
           --m_active_warps;
           assert(m_active_warps >= 0);
         }
@@ -1719,26 +1757,42 @@ bool compare_warps(shd_warp_t* warp1, shd_warp_t* warp2, std::vector<unsigned> c
   }
 }
 
-#define HIT_COUNT_WEIGHT 10
+bool compare_warps_by_count_only(shd_warp_t* warp1, shd_warp_t* warp2, std::vector<int> hit_count) {
+  if (warp1 && warp2) {
+    if (warp1->done_exit() || warp1->waiting()) {
+      return false;
+    } else if (warp2->done_exit() || warp2->waiting()) {
+      return true;
+    } else {
+      int warp1_priority = hit_count[warp1->get_warp_id()];
+      int warp2_priority = hit_count[warp2->get_warp_id()];
+      return warp1_priority > warp2_priority;
+    }
+  } else {
+    return true;
+  }
+}
 
 // order warps, then put them into m_next_cycle_prioritized_warps
 // at each cycle, scheduler_unit::cycle() will select a valid warp from m_next_cycle_prioritized_warps sequentially
 void custom_scheduler::order_warps() {
   m_next_cycle_prioritized_warps.clear();
-
   m_next_cycle_prioritized_warps.push_back(*m_last_supervised_issued); // greedy
 
   unsigned total_hit_count = std::accumulate((*m_last_supervised_issued)->m_L1D_hit_count.begin(),
                                              (*m_last_supervised_issued)->m_L1D_hit_count.end(), 0);
   
+  // hit count除总的count再乘一个权重，存进count_priority
+  int HIT_COUNT_WEIGHT = 100;
   std::vector<unsigned> count_priority;
-  for (const auto& hc : (*m_last_supervised_issued)->m_L1D_hit_count) {
+  for (const auto hc : (*m_last_supervised_issued)->m_L1D_hit_count) {
     unsigned cp = (unsigned)round(HIT_COUNT_WEIGHT * ((float)hc / total_hit_count));
     count_priority.push_back(cp);
   }
-  
-  // first sort, according to dynamic_id
+
   std::vector<shd_warp_t *> temp = m_supervised_warps;
+
+  // 拥有越小dynamic_id的warp越老，就有越大的gto_priority
   std::sort(temp.begin(), temp.end(), scheduler_unit::sort_warps_by_oldest_dynamic_id);
   unsigned gto_priority = 0;
   for (auto rit = temp.rbegin(); rit != temp.rend(); ++rit) { // reverse_iterator
@@ -1746,16 +1800,144 @@ void custom_scheduler::order_warps() {
     gto_priority++;
   }
 
-  // second sort, according to gto_priority and hit_count
-  std::sort(temp.begin(), temp.end(), [&](shd_warp_t* warp1, shd_warp_t* warp2) {
+  // 根据gto_priority+count_priority的大小排序
+  std::stable_sort(temp.begin(), temp.end(), [&](shd_warp_t* warp1, shd_warp_t* warp2) {
     return compare_warps(warp1, warp2, count_priority);
   });
 
-  for (shd_warp_t* warp : temp) {
+  for (auto warp : temp) {
     if (warp != *m_last_supervised_issued) {
       m_next_cycle_prioritized_warps.push_back(std::move(warp));
     }
   }
+
+  // 打印debug信息
+  // if (time(NULL) % 10 == 0) { 
+    
+  //   int print = 0;
+  //   for (auto cp : count_priority) {
+  //     if(cp != 0) print = 1;
+  //   }
+
+  //   if (print == 1) {
+  //     printf("\n");
+  //     printf("last issued warp %d\n", (*m_last_supervised_issued)->get_warp_id());
+  //     printf("warp id : count_priority(100 * x)\n");
+  //     int i = 0;
+  //     for (auto cp : count_priority) {
+  //       if(cp != 0) printf(" %u : %u |", i, cp);
+  //       i++;
+  //     }
+  //     printf("\n");
+    
+  //     printf("warp id : gto priority\n");
+  //     for (shd_warp_t* warp : temp) {
+  //       if(warp->get_warp_id() != -1) printf(" %d : %u |", warp->get_warp_id(), warp->get_warp_gto_priority());
+  //     }
+  //     printf("\n");
+  //   }
+  // }
+
+
+}
+
+// 试验一些想法
+void test_scheduler::order_warps() {
+
+  m_next_cycle_prioritized_warps.clear();
+  m_next_cycle_prioritized_warps.push_back(*m_last_supervised_issued);
+
+  std::vector<shd_warp_t *> temp;
+
+  // 在hit count都是0的时候，应该是什么策略？
+  // greedy then RR？
+  // const_iterator转成iterator
+  std::vector<shd_warp_t *>::iterator iter = m_supervised_warps.begin() + 
+              std::distance(m_supervised_warps.cbegin(), m_last_supervised_issued);
+
+  temp.insert(temp.end(), iter, m_supervised_warps.end());
+  temp.insert(temp.end(), m_supervised_warps.begin(), iter);
+  assert(temp.size()==m_supervised_warps.size());
+
+  std::stable_sort(temp.begin(), temp.end(), [&](shd_warp_t* warp1, shd_warp_t* warp2) {
+    return compare_warps_by_count_only(warp1, warp2, (*m_last_supervised_issued)->m_L1D_hit_count_new);
+  });
+
+  for (auto warp : temp) {
+    if (warp != *m_last_supervised_issued) {
+      m_next_cycle_prioritized_warps.push_back(std::move(warp));
+    }
+  }
+
+  // std::vector<std::vector<std::bitset<64>>> bitset = m_shader->m_ldst_unit->m_L1D_warp_bitset_array;
+  // // 选择当前拥有cacheline最多的warp
+  // std::vector<int> line_count;
+  // line_count.resize(64,0);
+  // for (int l = 0; l < bitset.size(); l++) {
+  //   for (int s = 0; s < 4; s++) {
+  //     for (int w = 0; w < 64; w++){
+  //       if (bitset[l][s].test(w)) {
+  //         line_count[w]++;
+  //       }
+  //     }
+  //   }
+  // }
+
+
+  // if (time(NULL)%10==0) {
+  //   for (int i = 0; i < 48; i++){
+  //     printf("%d ",count[i]);
+  //   }
+  //   printf("\n");
+  // }
+
+
+  // order_lrr(temp, m_supervised_warps,
+  //         m_last_supervised_issued, m_supervised_warps.size());
+
+  // std::sort(temp.begin(), temp.end(), scheduler_unit::sort_warps_by_oldest_dynamic_id);
+
+  // std::stable_sort(temp.begin(), temp.end(), [&](shd_warp_t* warp1, shd_warp_t* warp2) {
+  //   return compare_warps_by_count_only(warp1, warp2, count);
+  // });
+
+  // if (time(NULL) % 10 == 0) {
+  //   printf("core %d scheduler %d \n", m_shader->get_sid(), m_id);
+  //   for (auto warp : temp) {
+  //     printf("warp %d : ", warp->get_warp_id());
+  //     for (int i=0;i<48;i++){
+  //       printf("%d ", warp->m_L1D_hit_count[i]);
+  //     }
+  //     printf("\n");
+  //   }
+    // for (auto warp : temp) {
+    //   if(warp->get_warp_id() != -1) {
+    //     printf("%d ", (*m_last_supervised_issued)->m_L1D_hit_count[warp->get_warp_id()]);
+    //   }
+    // }
+    // printf("\n");
+  // }
+
+  // 先按GTO排序？
+
+  // std::vector<shd_warp_t *> head;
+  // std::vector<shd_warp_t *> tail;
+
+  // for (shd_warp_t* warp : temp) {
+  //   if(warp != *m_last_supervised_issued) {
+  //     if (warp->get_warp_id() != -1 &&
+  //             (*m_last_supervised_issued)->m_hit_bit.test(warp->get_warp_id())) {
+  //       head.push_back(warp);
+  //     } else {
+  //       tail.push_back(warp);
+  //     }
+  //   }
+  // }
+
+  // m_next_cycle_prioritized_warps.insert(
+  //       m_next_cycle_prioritized_warps.end(), head.begin(), head.end());
+  // m_next_cycle_prioritized_warps.insert(
+  //       m_next_cycle_prioritized_warps.end(), tail.begin(), tail.end());
 }
 
 void shader_core_ctx::read_operands() {
@@ -2174,15 +2356,138 @@ void ldst_unit::L1_latency_queue_cycle() {
                         m_core->get_gpu()->gpu_sim_cycle +
                             m_core->get_gpu()->gpu_tot_sim_cycle,
                         events, line_index);
-      unsigned warp_id = mf_next->get_wid();
       // when RESERVATION_FAIL, line_index = -1
-      if (line_index != -1) {
-        if (status == HIT || status == HIT_RESERVED) {
-          m_core->m_warp[m_L1D_line_wid[line_index]]->m_L1D_hit_count[warp_id]++;
+      
+      std::bitset<4> sector_mask = mf_next->get_access_sector_mask();
+
+      int mf_warp_id = mf_next->get_wid();
+
+      // 统计数据: sector被替换的时候，有多少warp共享它 
+      // ============================================================
+      if (status == SECTOR_MISS) {
+        for (int s = 0; s < 4; s++) {
+          if (sector_mask.test(s)) {
+            int c = m_L1D_warp_bitset_array[line_index][s].count();
+            if(c < m_sector_access_count.size()){
+              m_sector_access_count[c]++;
+            }
+          }
+        }   
+      }
+      // 如果这个sector的bitset全0，说明它是没使用过的缓存行
+      // 如果这个sector的bitset不是全0，说明它是被选中替换的
+      if (status == MISS) {
+        for (int s = 0; s < 4; s++) {
+          if(!m_L1D_warp_bitset_array[line_index][s].none()) {
+            int c = m_L1D_warp_bitset_array[line_index][s].count();
+            if(c < m_sector_access_count.size()){
+              m_sector_access_count[c]++;
+            }
+          }
+        }  
+      }
+      // ============================================================
+
+      // tag没命中, 得到一个可重填的idx, 整行重填
+      if (status == MISS) {
+        m_L1D_warp_id_array_only_line[line_index] = mf_warp_id;
+        for (int s = 0; s < 4; s++) {
+          m_L1D_warp_id_array[line_index][s] = mf_warp_id;
+          // m_L1D_warp_bitset_sched_idx_array[line_index][s] = mf_scheduler_id;
+          m_L1D_warp_bitset_array[line_index][s].reset();
+          m_L1D_warp_bitset_array[line_index][s].set(mf_warp_id);
+
+          m_load_warp_id_array[line_index][s] = mf_warp_id;
         }
-        m_L1D_line_wid[line_index] = warp_id;
+      }
+      
+      // tag命中, sector miss，只重填sector
+      if (status ==SECTOR_MISS) {
+        for (int s = 0; s < 4; s++) {
+          if (sector_mask.test(s)) {
+            m_L1D_warp_id_array[line_index][s] = mf_warp_id;
+            // m_L1D_warp_bitset_sched_idx_array[line_index][s] = mf_scheduler_id;
+            m_L1D_warp_bitset_array[line_index][s].reset();
+            m_L1D_warp_bitset_array[line_index][s].set(mf_warp_id);
+
+            m_load_warp_id_array[line_index][s] = mf_warp_id;
+          }
+        }
       }
 
+      if (status == HIT || status == HIT_RESERVED) {
+        m_L1D_warp_id_array_only_line[line_index] = mf_warp_id;
+        for (int s = 0; s < 4; s++) {
+          if (sector_mask.test(s)) {
+            int sector_warp_id = m_L1D_warp_id_array[line_index][s];
+
+            if (sector_warp_id != -1) {
+              // 统计数据：sector被加载进来后，被加载的warp访问多少次，被其他warp访问多少次
+              // ===========================================================
+              if (m_load_warp_id_array[line_index][s] == mf_warp_id)
+                m_sector_access_by_load_warp++;
+              else 
+                m_sector_access_by_other_warp++;
+              // ===========================================================
+
+              // warp1命中了warp2的line，那么两个warp都要增加对方的计数
+              m_core->m_warp[sector_warp_id]->m_L1D_hit_count[mf_warp_id]++;
+              m_core->m_warp[mf_warp_id]->m_L1D_hit_count[sector_warp_id]++;
+              // 更新sector的warp id
+              m_L1D_warp_id_array[line_index][s] = mf_warp_id;
+            }
+
+
+      
+            for (int w = 0; w < m_max_warps_per_shader; w++){
+                if (m_L1D_warp_bitset_array[line_index][s].test(w) && (mf_warp_id != w)){
+                  m_core->m_warp[w]->m_L1D_hit_count_new[mf_warp_id]++;
+                  m_core->m_warp[mf_warp_id]->m_L1D_hit_count[w]++;
+                }
+            }
+            m_L1D_warp_bitset_array[line_index][s].set(mf_warp_id);
+          }   
+        } 
+      }
+
+
+      // miss的时候是重填整个cacheline吗？
+
+      // std::cout << "status: " << static_cast<int>(status) << std::endl;
+      // miss时会返回一个可供alloc的idx，可能和之前idx不一样
+      // 如果idx的cacheline未被使用过，得到的一样的idx -> 直接更新warpid即可
+      // 如果idx的cacheline使用过，替换算法选择的也是这一个cacheline，返回一样的idx -> 直接更新warpid即可
+      // 如果idx的cacheline使用过，但是替换的别的cacheline，返回不一样的idx
+      // 原idx的cacheline的warpid不需要改，因为没被做任何事情
+      // 新idx的cacheline被逐出，因此更新warpid
+      // 所以MISS时只需要改新的idx的warpid
+      // line逐出的时机：flush和invalidtae，以及miss的时候，选一个进行替换
+
+
+        // if (status == HIT || status == HIT_RESERVED) {
+        //   for (int i = 0; i < m_config->max_warps_per_shader; i++) {
+        //     if (bits.test(i) && i != mf_warp_id) {
+        //       m_core->m_warp[i]->m_L1D_hit_count[mf_warp_id]++;
+        //     }
+        //   }
+        // }
+
+        // if (status == HIT || status == HIT_RESERVED) {
+        //   m_core->m_warp[m_L1D_line_wid[line_index]]->m_L1D_hit_count[mf_warp_id]++;
+        // }
+        // m_L1D_line_wid[line_index] = mf_warp_id;
+        // }
+          // if (m_core->m_warp[m_L1D_line_wid[line_index]]->m_L1D_hit_count_nbit[mf_warp_id] <= 7) {
+          //   m_core->m_warp[m_L1D_line_wid[line_index]]->m_L1D_hit_count_nbit[mf_warp_id]++;
+          // }
+
+        // 如果命中
+        // 1.先把该line所有bitset为1的warp（不加自己的）的hit count数组中，此次mf的warp对应计数+1
+        // 2.再把mf的warp对应的bitset位置1
+        // line被allocate的时候把bitset初始化
+        // line被逐出的时候把bitset重置
+        // MISS的时候不需要对hit count操作
+        
       bool write_sent = was_write_sent(events);
       bool read_sent = was_read_sent(events);
 
@@ -2381,11 +2686,31 @@ void ldst_unit::fill(mem_fetch *mf) {
 void ldst_unit::flush() {
   // Flush L1D cache
   m_L1D->flush();
+  
+  for (int i = 0; i < m_config->m_L1D_config.get_num_lines(); i++) {
+    if (m_L1D->m_tag_array->m_lines[i]->is_modified_line()) {
+      m_L1D_warp_id_array_only_line[i] = -1;
+      for(int s = 0; s < 4; s++) {
+        m_L1D_warp_id_array[i][s] = -1;
+        m_L1D_warp_bitset_array[i][s].reset();
+        m_load_warp_id_array[i][s] = -1;
+      }
+    }
+  }
 }
 
 void ldst_unit::invalidate() {
   // Flush L1D cache
   m_L1D->invalidate();
+
+  for (int i = 0; i < m_config->m_L1D_config.get_num_lines(); i++) {
+    m_L1D_warp_id_array_only_line[i] = -1;
+    for(int s = 0; s < 4; s++) {
+      m_L1D_warp_id_array[i][s] = -1;
+      m_L1D_warp_bitset_array[i][s].reset();
+      m_load_warp_id_array[i][s] = -1;
+    }
+  }
 }
 
 simd_function_unit::simd_function_unit(const shader_core_config *config) {
@@ -2672,8 +2997,7 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
   assert(config->smem_latency > 1);
   init(icnt, mf_allocator, core, operand_collector, scoreboard, config,
        mem_config, stats, sid, tpc);
-  m_L1D_line_wid.resize(m_config->m_L1D_config.get_max_num_lines());
-  std::fill_n(m_L1D_line_wid.begin(), m_config->m_L1D_config.get_max_num_lines(), -1);
+  m_max_warps_per_shader = config->max_warps_per_shader;
   if (!m_config->m_L1D_config.disabled()) {
     char L1D_name[STRSIZE];
     snprintf(L1D_name, STRSIZE, "L1D_%03d", m_sid);
@@ -2688,6 +3012,34 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
       l1_latency_queue[j].resize(m_config->m_L1D_config.l1_latency,
                                  (mem_fetch *)NULL);
   }
+
+  // printf("L1D config: \n");
+  // printf("L1D size: %d KB \n", m_config->m_L1D_config.get_total_size_inKB());
+  // printf("line size: %d B \n", m_config->m_L1D_config.get_line_sz());
+  // printf("line num: %d \n", m_config->m_L1D_config.get_max_num_lines());
+  // printf("set num: %d \n", m_config->m_L1D_config.get_nset());
+  // printf("assoc num: %d \n", m_config->m_L1D_config.get_max_assoc());
+
+  // volta架构是L1D和shared mem共用一块空间，总共128KB
+  // L1D默认32KB，对应get_num_lines()
+  // 如果没用到shared mem，L1D就会扩展到128KB，对应get_max_num_lines()
+  // 这个自动扩展选项已经关掉，现在L1D是固定的32KB
+  unsigned cache_lines_num = m_config->m_L1D_config.get_num_lines();
+  m_L1D_warp_id_array.resize(cache_lines_num, std::vector<int>(4));
+  m_L1D_warp_id_array_only_line.resize(cache_lines_num, -1);
+  m_L1D_warp_bitset_array.resize(cache_lines_num, std::vector<std::bitset<64>>(4));
+  m_load_warp_id_array.resize(cache_lines_num, std::vector<int>(4));
+
+  for (int i = 0; i < cache_lines_num; i++) {
+    for(int s = 0; s < 4; s++) {
+      m_L1D_warp_id_array[i][s] = -1;
+      m_L1D_warp_bitset_array[i][s].reset();
+      m_load_warp_id_array[i][s] = -1;
+    }
+  }
+
+  m_sector_access_count.resize(20, 0);
+
   m_name = "MEM ";
 }
 
@@ -3119,6 +3471,63 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
   // L1I
   struct cache_sub_stats total_css;
   struct cache_sub_stats css;
+
+  if (!m_shader_config->m_L1D_config.disabled()) {
+    std::vector<unsigned long long> tot_count(20);
+    unsigned long long tot_by_load = 0;
+    unsigned long long tot_by_other = 0;
+
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; ++i) {
+      std::vector<unsigned long long> count(20);
+      unsigned long long by_load = 0;
+      unsigned long long by_other = 0;
+      m_cluster[i]->get_sector_access_count(count, by_load, by_other);
+      for (int i = 0; i < count.size(); ++i) {
+          tot_count[i] += count[i];
+      }
+      tot_by_load += by_load;
+      tot_by_other += by_other;
+    }
+
+    unsigned long long tot_access = 0;
+    fprintf(fout, "sector_access_count  ");
+    for(int i=0;i<tot_count.size();i++){
+      fprintf(fout, " %d:%llu ", i, tot_count[i]);
+      if(i>=2) {
+        tot_access += tot_count[i];
+      }
+    }
+    fprintf(fout, "\n");
+    if (tot_access != 0) {
+      fprintf(fout, "  2:%f  ", (double)tot_count[2]/tot_access);
+      fprintf(fout, "  3:%f  ", (double)tot_count[3]/tot_access);
+      fprintf(fout, "  4:%f  ", (double)tot_count[4]/tot_access);
+      fprintf(fout, "  5:%f  ", (double)tot_count[5]/tot_access);
+      unsigned long long cnt_6_10=0;
+      unsigned long long cnt_11_19=0;
+      for(int i=6;i<=10;i++){
+        cnt_6_10 += tot_count[i];
+      }
+      for(int i=11;i<=19;i++){
+        cnt_11_19 += tot_count[i];
+      }
+      fprintf(fout, "  6-10:%f  ", (double)cnt_6_10/tot_access);
+      fprintf(fout, "  11-19:%f  ", (double)cnt_11_19/tot_access);
+    }
+    else {
+      fprintf(fout, "tot_access(i>=2) == 0");
+    }
+    fprintf(fout, "\n");
+
+    fprintf(fout, "tot_by_load: %llu \n", tot_by_load);
+    fprintf(fout, "tot_by_other: %llu \n", tot_by_other);
+    if (tot_by_load != 0 && tot_by_other != 0) {
+      fprintf(fout, "tot_by_load: %llu    %f\n", tot_by_load, (double)tot_by_load/(tot_by_load+tot_by_other));
+      fprintf(fout, "tot_by_other: %llu    %f\n", tot_by_other, (double)tot_by_other/(tot_by_load+tot_by_other));
+      fprintf(fout, "\n");
+    }
+
+  }
 
   if (!m_shader_config->m_L1I_config.disabled()) {
     total_css.clear();
@@ -4793,6 +5202,15 @@ void simt_core_cluster::get_L1D_sub_stats(struct cache_sub_stats &css) const {
     total_css += temp_css;
   }
   css = total_css;
+}
+void simt_core_cluster::get_sector_access_count(std::vector<unsigned long long> &count, unsigned long long &by_load, unsigned long long &by_other){
+  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; ++i) {
+    for(int j=0;j<m_core[i]->m_ldst_unit->m_sector_access_count.size();j++){
+      count[j] += m_core[i]->m_ldst_unit->m_sector_access_count[j];
+    }
+    by_load += m_core[i]->m_ldst_unit->m_sector_access_by_load_warp;
+    by_other += m_core[i]->m_ldst_unit->m_sector_access_by_other_warp;
+  }
 }
 void simt_core_cluster::get_L1C_sub_stats(struct cache_sub_stats &css) const {
   struct cache_sub_stats temp_css;
