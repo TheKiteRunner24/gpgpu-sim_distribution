@@ -1725,7 +1725,7 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
 
   // determine hardware threads and warps that will be used for this CTA
   int cta_size = kernel.threads_per_cta();
-
+const class function_info *kernel_ljz = kernel.entry();
   // hw warp id = hw thread id mod warp size, so we need to find a range
   // of hardware thread ids corresponding to an integral number of hardware
   // thread ids
@@ -1747,7 +1747,8 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
            m_occupied_cta_to_hwtid.end());
     m_occupied_cta_to_hwtid[free_cta_hw_id] = start_thread;
   }
-
+   const struct gpgpu_ptx_sim_info *kernel_info = ptx_sim_kernel_info(kernel_ljz);
+  printf("occupied %u registers\n",kernel_info->regs);
   // reset the microarchitecture state of the selected hardware thread and warp
   // contexts
   reinit(start_thread, end_thread, false);
