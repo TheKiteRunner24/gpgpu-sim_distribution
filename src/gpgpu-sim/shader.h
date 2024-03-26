@@ -385,6 +385,7 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_WARP_LIMITING,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
   CONCRETE_SCHEDULER_CUSTOM,
+  CONCRETE_SCHEDULER_CUSTOM_THRROTTLE,
   CONCRETE_SCHEDULER_TEST,
   NUM_CONCRETE_SCHEDULERS
 };
@@ -709,10 +710,10 @@ class opndcoll_rfu_t {  // operand collector based register file unit
   bool writeback(warp_inst_t &warp);
 
   void step() {
-    dispatch_ready_cu();
-    allocate_reads();
-    for (unsigned p = 0; p < m_in_ports.size(); p++) allocate_cu(p);
-    process_banks();
+    dispatch_ready_cu();//将有cu里面准备好操作数的发给执行单元
+    allocate_reads(); //选没有conflict的operand进行伪读取
+    for (unsigned p = 0; p < m_in_ports.size(); p++) allocate_cu(p); //放进cu里面做选择
+    process_banks();  //清空标记
   }
 
   void dump(FILE *fp) const {
@@ -938,7 +939,7 @@ class opndcoll_rfu_t {  // operand collector based register file unit
           unsigned bank = op.get_bank();
           m_queue[bank].push_back(op);
         }
-      }
+      }//在opc allocate的时候发起读请求供arbiter来选择
     }
     bool bank_idle(unsigned bank) const {
       return m_allocated_bank[bank].is_free();
@@ -992,6 +993,7 @@ class opndcoll_rfu_t {  // operand collector based register file unit
       m_warp = NULL;
       m_output_register = NULL;
       m_src_op = new op_t[MAX_REG_OPERANDS * 2];
+    //  m_oprand_pc =new unsigned[MAX_REG_OPERANDS*2];
       m_not_ready.reset();
       m_warp_id = -1;
       m_num_banks = 0;
@@ -1023,7 +1025,9 @@ class opndcoll_rfu_t {  // operand collector based register file unit
     unsigned get_num_regs() const { return m_warp->get_num_regs(); }
     void dispatch();
     bool is_free() { return m_free; }
-
+    // void collect_oprand_pc(op_t op){
+    //   find_pc(op->get_reg_id());
+    // }
    private:
     bool m_free;
     unsigned m_cuid;  // collector unit hw id
@@ -1032,6 +1036,7 @@ class opndcoll_rfu_t {  // operand collector based register file unit
     register_set
         *m_output_register;  // pipeline register to issue to when ready
     op_t *m_src_op;
+    // unsigned *m_oprand_pc;
     std::bitset<MAX_REG_OPERANDS * 2> m_not_ready;
     unsigned m_num_banks;
     unsigned m_bank_warp_shift;

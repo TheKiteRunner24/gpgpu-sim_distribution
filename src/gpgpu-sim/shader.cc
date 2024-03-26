@@ -202,9 +202,11 @@ void shader_core_ctx::create_schedulers() {
                                   ? CONCRETE_SCHEDULER_WARP_LIMITING
                                   : sched_config.find("custom") != std::string::npos
                                         ? CONCRETE_SCHEDULER_CUSTOM
-                                        : sched_config.find("test") != std::string::npos
-                                              ? CONCRETE_SCHEDULER_TEST
-                                              : NUM_CONCRETE_SCHEDULERS;
+                                        : sched_config.find("custom-throttle") != std::string::npos
+                                            ? CONCRETE_SCHEDULER_CUSTOM_THRROTTLE
+                                            : sched_config.find("test") != std::string::npos
+                                                ? CONCRETE_SCHEDULER_TEST
+                                                : NUM_CONCRETE_SCHEDULERS;
   assert(scheduler != NUM_CONCRETE_SCHEDULERS);
 
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
@@ -258,6 +260,14 @@ void shader_core_ctx::create_schedulers() {
             &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
         break;
       case CONCRETE_SCHEDULER_CUSTOM:
+        schedulers.push_back(new custom_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i));
+        break;
+      case CONCRETE_SCHEDULER_CUSTOM_THRROTTLE:
         schedulers.push_back(new custom_scheduler(
             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
             &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
@@ -1377,6 +1387,12 @@ void scheduler_unit::cycle() {
                 (pI->op == MEMORY_BARRIER_OP) ||
                 (pI->op == TENSOR_CORE_LOAD_OP) ||
                 (pI->op == TENSOR_CORE_STORE_OP)) {
+              
+              // if((((m_shader->m_ldst_unit->m_L1D->get_miss_queue_size()))>=(((m_shader->m_ldst_unit->m_L1D->m_config).m_miss_queue_size)-2))
+              //  && warp_id==((*m_next_cycle_prioritized_warps.begin())->get_warp_id())) {
+              //   continue;
+              // }    
+              // else 
               if (m_mem_out->has_free(m_shader->m_config->sub_core_model,
                                       m_id) &&
                   (!diff_exec_units ||
@@ -1781,16 +1797,29 @@ void custom_scheduler::order_warps() {
 
   unsigned total_hit_count = std::accumulate((*m_last_supervised_issued)->m_L1D_hit_count.begin(),
                                              (*m_last_supervised_issued)->m_L1D_hit_count.end(), 0);
-  
+
+  std::vector<shd_warp_t *> temp = m_supervised_warps;
+ std::vector<int> intra_hit_count;
+ intra_hit_count.resize((*m_last_supervised_issued)->m_L1D_hit_count.size());
+    std::fill_n(intra_hit_count.begin(), (*m_last_supervised_issued)->m_L1D_hit_count.size(), 0);
+  for(std::vector<shd_warp_t *>::iterator supervised_iter =
+               m_supervised_warps.begin();
+           supervised_iter != m_supervised_warps.end(); supervised_iter++){
+            if((((*supervised_iter)->get_warp_id())!=(unsigned)-1)  ){
+            intra_hit_count[(*supervised_iter)->get_warp_id()] =((*supervised_iter)->m_L1D_hit_count[(*supervised_iter)->get_warp_id()]);//(*supervised_iter)->get_warp_id()]);
+            }
+  }
   // hit count除总的count再乘一个权重，存进count_priority
   int HIT_COUNT_WEIGHT = 100;
   std::vector<unsigned> count_priority;
-  for (const auto hc : (*m_last_supervised_issued)->m_L1D_hit_count) {
-    unsigned cp = (unsigned)round(HIT_COUNT_WEIGHT * ((float)hc / total_hit_count));
+  for (int i=0;i<(*m_last_supervised_issued)->m_L1D_hit_count.size(); i++) {
+    unsigned cp = (unsigned)round(HIT_COUNT_WEIGHT * ((*m_last_supervised_issued)->m_L1D_hit_count[i]+intra_hit_count[i]));
     count_priority.push_back(cp);
   }
-
-  std::vector<shd_warp_t *> temp = m_supervised_warps;
+  // for (const auto hc : (*m_last_supervised_issued)->m_L1D_hit_count) {
+  //   unsigned cp = (unsigned)round(HIT_COUNT_WEIGHT * ((float)hc / total_hit_count));
+  //   count_priority.push_back(cp);
+  // }
 
   // 拥有越小dynamic_id的warp越老，就有越大的gto_priority
   std::sort(temp.begin(), temp.end(), scheduler_unit::sort_warps_by_oldest_dynamic_id);
@@ -4587,12 +4616,12 @@ void opndcoll_rfu_t::add_cu_set(unsigned set_id, unsigned num_cu,
   m_cus[set_id].reserve(num_cu);  // this is necessary to stop pointers in m_cu
                                   // from being invalid do to a resize;
   for (unsigned i = 0; i < num_cu; i++) {
-    m_cus[set_id].push_back(collector_unit_t());
+    m_cus[set_id].push_back(collector_unit_t()); //每一个功能单元配一个cu
     m_cu.push_back(&m_cus[set_id].back());
   }
   // for now each collector set gets dedicated dispatch units.
   for (unsigned i = 0; i < num_dispatch; i++) {
-    m_dispatch_units.push_back(dispatch_unit_t(&m_cus[set_id]));
+    m_dispatch_units.push_back(dispatch_unit_t(&m_cus[set_id])); //每一类功能单元配num_dispatch个dispatcher
   }
 }
 
@@ -4705,7 +4734,7 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
 void opndcoll_rfu_t::dispatch_ready_cu() {
   for (unsigned p = 0; p < m_dispatch_units.size(); ++p) {
     dispatch_unit_t &du = m_dispatch_units[p];
-    collector_unit_t *cu = du.find_ready();
+    collector_unit_t *cu = du.find_ready();//寻找对应到每个diaptch unit里面是否有cu准备好，每一类cu对应多个dispatch unit，通过rr做仲裁
     if (cu) {
       for (unsigned i = 0; i < (cu->get_num_operands() - cu->get_num_regs());
            i++) {
@@ -4759,7 +4788,7 @@ void opndcoll_rfu_t::allocate_cu(unsigned port_num) {
           if (cu_set[k].is_free()) {
             collector_unit_t *cu = &cu_set[k];
             allocated = cu->allocate(inp.m_in[i], inp.m_out[i]);
-            m_arbiter.add_read_requests(cu);
+            m_arbiter.add_read_requests(cu);  //刚刚放进去请求给arbiter来仲裁
             break;
           }
         }
@@ -4784,15 +4813,16 @@ void opndcoll_rfu_t::allocate_reads() {
     unsigned bank =
         register_bank(reg, wid, m_num_banks, m_bank_warp_shift, sub_core_model,
                       m_num_banks_per_sched, rr.get_sid());
-    m_arbiter.allocate_for_read(bank, rr);
-    read_ops[bank] = rr;
+    m_arbiter.allocate_for_read(bank, rr); //不知道read_op和m_allocated_banks的具体区别，似乎后者看起来只处理读写同一个bank的情况
+    read_ops[bank] = rr; //todo需要在这个地方同时读一下op对应的pc
   }
   std::map<unsigned, op_t>::iterator r;
   for (r = read_ops.begin(); r != read_ops.end(); ++r) {
     op_t &op = r->second;
     unsigned cu = op.get_oc_id();
     unsigned operand = op.get_operand();
-    m_cu[cu]->collect_operand(operand);
+    m_cu[cu]->collect_operand(operand);  //在这里面只是单纯地复位对应的op，不涉及读取实际的值
+    // m_cu[cu]->collect_oprand_pc(op);
     if (m_shader->get_config()->gpgpu_clock_gated_reg_file) {
       unsigned active_count = 0;
       for (unsigned i = 0; i < m_shader->get_config()->warp_size;
@@ -4889,7 +4919,7 @@ void opndcoll_rfu_t::collector_unit_t::dispatch() {
   m_output_register->move_in(m_sub_core_model, m_reg_id, m_warp);
   m_free = true;
   m_output_register = NULL;
-  for (unsigned i = 0; i < MAX_REG_OPERANDS * 2; i++) m_src_op[i].reset();
+  for (unsigned i = 0; i < MAX_REG_OPERANDS * 2; i++) m_src_op[i].reset(); //需要返回一个上次写入对应op的pc
 }
 
 void exec_simt_core_cluster::create_shader_core_ctx() {
