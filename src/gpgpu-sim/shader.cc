@@ -1388,12 +1388,11 @@ void scheduler_unit::cycle() {
                 (pI->op == TENSOR_CORE_LOAD_OP) ||
                 (pI->op == TENSOR_CORE_STORE_OP)) {
               
-              // if((((m_shader->m_ldst_unit->m_L1D->get_miss_queue_size()))>=(((m_shader->m_ldst_unit->m_L1D->m_config).m_miss_queue_size)-2))
-              //  && warp_id==((*m_next_cycle_prioritized_warps.begin())->get_warp_id())) {
-              //   continue;
-              // }    
-              // else 
-              if (m_mem_out->has_free(m_shader->m_config->sub_core_model,
+              if(m_shader->m_ldst_unit->m_L1D->miss_queue_full(0)
+               && warp_id==((*m_next_cycle_prioritized_warps.begin())->get_warp_id())) {
+                break;
+              }    
+              else if (m_mem_out->has_free(m_shader->m_config->sub_core_model,
                                       m_id) &&
                   (!diff_exec_units ||
                    previous_issued_inst_exec_type != exec_unit_type_t::MEM)) {

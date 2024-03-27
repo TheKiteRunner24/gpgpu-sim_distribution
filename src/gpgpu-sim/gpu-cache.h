@@ -841,10 +841,7 @@ class cache_config {
     return m_write_alloc_policy;
   }
   write_policy_t get_write_policy() { return m_write_policy; }
-union {
-    unsigned m_miss_queue_size;
-    unsigned m_rob_entries;
-  };
+
  protected:
   void exit_parse_error() {
     printf("GPGPU-Sim uArch: cache configuration parsing error (%s)\n",
@@ -883,7 +880,10 @@ union {
     unsigned m_mshr_max_merge;
     unsigned m_request_fifo_entries;
   };
-  
+  union {
+    unsigned m_miss_queue_size;
+    unsigned m_rob_entries;
+  };
   unsigned m_result_fifo_entries;
   unsigned m_data_port_width;  //< number of byte the cache can access per cycle
   enum set_index_function
@@ -1331,9 +1331,7 @@ class baseline_cache : public cache_t {
   void get_sub_stats_pw(struct cache_sub_stats_pw &css) const {
     m_stats.get_sub_stats_pw(css);
   }
-  unsigned get_miss_queue_size() const{
-    return m_miss_queue.size();
-  }
+
   // accessors for cache bandwidth availability
   bool data_port_free() const {
     return m_bandwidth_management.data_port_free();
@@ -1366,10 +1364,12 @@ class baseline_cache : public cache_t {
 
  public:
   tag_array *m_tag_array;
-cache_config &m_config;
+  bool miss_queue_full(unsigned num_miss) {
+    return ((m_miss_queue.size() + num_miss) >= m_config.m_miss_queue_size);
+  }
  protected:
   std::string m_name;
-  
+  cache_config &m_config;
   mshr_table m_mshrs;
   std::list<mem_fetch *> m_miss_queue;
   enum mem_fetch_status m_miss_queue_status;
@@ -1407,9 +1407,7 @@ cache_config &m_config;
 
   /// Checks whether this request can be handled on this cycle. num_miss equals
   /// max # of misses to be handled on this cycle
-  bool miss_queue_full(unsigned num_miss) {
-    return ((m_miss_queue.size() + num_miss) >= m_config.m_miss_queue_size);
-  }
+
   /// Read miss handler without writeback
   void send_read_request(new_addr_type addr, new_addr_type block_addr,
                          unsigned cache_index, mem_fetch *mf, unsigned time,
